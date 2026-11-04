@@ -77,11 +77,44 @@ class BancoDadosDepois:
         # Semente inicial (apenas se tabela vazia)
         conn.execute(
             "INSERT OR IGNORE INTO produtos (id, nome, preco, estoque) VALUES (?, ?, ?, ?)",
-            ("PROD-001", "Produto A", 100.0, 5),
+            ("PROD-001", "Produto A", 100.0, 10),  # 10 unidades para permitir pedidos de teste
         )
         conn.execute(
             "INSERT OR IGNORE INTO produtos (id, nome, preco, estoque) VALUES (?, ?, ?, ?)",
             ("PROD-002", "Produto B", 50.0, 10),
+        )
+        conn.commit()
+        # Insere pedidos fictícios de teste com pagamentos correspondentes
+        self._inserir_pedidos_teste(conn)
+
+    def _inserir_pedidos_teste(self, conn):
+        """
+        Insere pelo menos dois pedidos fictícios e registros de pagamento
+        correspondentes, ligados pelos IDs de pedido.
+        Só executa se ainda não houver pedidos de teste (evita duplicar).
+        """
+        cur = conn.execute("SELECT COUNT(*) FROM pedidos WHERE id LIKE 'PED-TEST-%'")
+        if cur.fetchone()[0] > 0:
+            return  # já existem pedidos de teste
+
+        pedidos_teste = [
+            ("PED-TEST-001", "PROD-001", 2, "confirmado"),
+            ("PED-TEST-002", "PROD-002", 3, "confirmado"),
+        ]
+        pagamentos_teste = [
+            ("PED-TEST-001", 200.0, "aprovado"),   # 2 x 100.0
+            ("PED-TEST-002", 150.0, "aprovado"),    # 3 x 50.0
+        ]
+
+        conn.executemany(
+            "INSERT OR IGNORE INTO pedidos (id, produto_id, quantidade, status) "
+            "VALUES (?, ?, ?, ?)",
+            pedidos_teste,
+        )
+        conn.executemany(
+            "INSERT OR IGNORE INTO pagamentos (pedido_id, valor, status) "
+            "VALUES (?, ?, ?)",
+            pagamentos_teste,
         )
         conn.commit()
 
