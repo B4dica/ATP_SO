@@ -1,0 +1,3 @@
+# Dependências do projeto ATP_SO
+# Todas são da biblioteca padrão do Python (stdlib): threading, sqlite3, etc.
+# Não há dependências externas necessárias para rodar as simulações.
