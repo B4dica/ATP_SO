@@ -1,6 +1,6 @@
 """
 Módulo: depois/main.py
-Ponto de entrada da versão DEPOIS (sistema refatorado e seguro).
+Ponto de entrada da versão DEPOIS (banco de dados SQLite com controle de concorrência).
 """
 
 from .servidor import ServidorDepois

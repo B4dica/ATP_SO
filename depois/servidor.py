@@ -1,45 +1,44 @@
 """
 Módulo: depois/servidor.py
 ============================================================
-VERSÃO "DEPOIS" - Simulador de servidor de e-commerce refatorado
-============================================================
+VERSÃO "DEPOIS" - Simulador de servidor de e-commerce com banco de dados real
 
-Demonstra que os mesmos cenários da versão ANTES são neutralizados:
-  1. Estoque atômico (sem race condition / lost update).
-  2. Compra segura sem deadlock (ordem global + try_lock + rollback).
-  3. Relatórios executam sem starvation (pool isolado + aging).
+Demonstra, com queries SQL, que os mesmos cenários da versão ANTES são
+neutralizados:
+  1. Estoque atômico via SELECT ... FOR UPDATE (sem race condition).
+  2. Compra segura sem deadlock (ordem global + BEGIN IMMEDIATE + busy_timeout + ROLLBACK).
+  3. Relatórios sem starvation (pool de leitura isolado + aging).
 """
 
 import threading
 import time
-import random
+import uuid
 
+from .banco import BancoDadosDepois
 from .estoque import EstoqueDepois
-from .financeiro import FinanceiroDepois, executar_compra_segura
-from .relatorio import GerenciadorRelatoriosDepois, PoolConexoes, EnvelhecimentoPrioridade
-from . import config
+from .financeiro import executar_compra_segura
+from .relatorio import GerenciadorRelatoriosDepois
 
 
 class ServidorDepois:
     def __init__(self):
-        self.estoque = EstoqueDepois()
-        self.financeiro = FinanceiroDepois()
+        # Banco para compras/escritas (transações BEGIN IMMEDIATE)
+        self.bd_compras = BancoDadosDepois()
 
-        # Pools ISOLADOS: compras e relatórios não competem pelas mesmas conexões.
-        pool_compras = PoolConexoes(config.POOL_COMPRAS, "compras")
-        pool_relatorios = PoolConexoes(config.POOL_RELATORIOS, "relatorios")
-        envelhecimento = EnvelhecimentoPrioridade()
-        self.relatorios = GerenciadorRelatoriosDepois(pool_relatorios, envelhecimento)
+        # Banco para relatórios/leituras (mesmo arquivo .db, conexão dedicada)
+        # Em SQLite + WAL, leituras concorrentes não bloqueiam escritas.
+        self.bd_relatorios = BancoDadosDepois(caminho_db=self.bd_compras.caminho_db)
 
-        # Mantemos a referência do pool de compras (útil para diagnóstico)
-        self.pool_compras = pool_compras
+        self.estoque = EstoqueDepois(self.bd_compras)
+        self.relatorios = GerenciadorRelatoriosDepois(self.bd_relatorios)
 
-    # ----------------------------------------------------------------
-    # Cenário 1: Estoque atômico (sem corrida)
-    # ----------------------------------------------------------------
+    # ------------------------------------------------------------
+    # Cenário 1: Estoque atômico via SQL (sem race condition)
+    # ------------------------------------------------------------
     def simular_corrida_estoque(self, produto_id="PROD-001", n_threads=20):
         print("\n" + "=" * 60)
-        print("Cenário 1: Estoque Atômico (" + str(n_threads) + " threads concorrentes)")
+        print("Cenário 1: Estoque Atômico via SQL (" +
+              str(n_threads) + " threads concorrentes)")
         print("=" * 60)
         estoque_inicial = self.estoque.quantidade(produto_id)
         print("Estoque inicial de " + produto_id + ": " + str(estoque_inicial))
@@ -52,7 +51,8 @@ class ServidorDepois:
                 with lock_sucesso:
                     sucessos[0] += 1
 
-        threads = [threading.Thread(target=reserva) for _ in range(n_threads)]
+        threads = [threading.Thread(target=reserva, daemon=True)
+                   for _ in range(n_threads)]
         for t in threads:
             t.start()
         for t in threads:
@@ -69,7 +69,7 @@ class ServidorDepois:
         elif sucessos[0] != vendas_esperadas:
             print("AVISO: número de vendas diferente do esperado.")
         else:
-            print("OK: estoque consistente, sem overselling nem estoque negativo.")
+            print("OK: estoque consistente via UPDATE condicional + BEGIN IMMEDIATE, sem overselling.")
 
         return {
             "estoque_inicial": estoque_inicial,
@@ -78,44 +78,48 @@ class ServidorDepois:
             "vendas_esperadas": vendas_esperadas,
         }
 
-    # ----------------------------------------------------------------
-    # Cenário 2: Compra segura sem deadlock
-    # ----------------------------------------------------------------
+    # ------------------------------------------------------------
+    # Cenário 2: Compra segura sem deadlock (ordem global + SQL)
+    # ------------------------------------------------------------
     def simular_compra_segura(self, produto_id="PROD-001", quantidade=1,
                               preco=100.0, n_threads=10):
         print("\n" + "=" * 60)
         print("Cenário 2: Compras Concorrentes Sem Deadlock (" +
               str(n_threads) + " threads)")
         print("=" * 60)
-        print("Ordem global de locks: ESTOQUE -> FINANCEIRO (try_lock + timeout 5s)")
+        print("Ordem global de recursos no banco: ESTOQUE -> PEDIDO -> FINANCEIRO")
+        try:
+            from . import config
+            print("try_lock via BEGIN IMMEDIATE + busy_timeout = " +
+                  str(config.TIMEOUT_LOCK_SEGUNDOS) + "s")
+        except Exception:
+            print("try_lock via BEGIN IMMEDIATE + busy_timeout = 5s")
 
         resultados = {"sucesso": 0, "falha_estoque": 0, "timeout": 0}
         lock_res = threading.Lock()
 
         def compra_thread():
+            pedido_id = "PED-SIM-" + uuid.uuid4().hex[:6]
             try:
-                ok = executar_compra_segura(
-                    self.estoque, self.financeiro,
+                res = executar_compra_segura(
+                    self.bd_compras,
                     produto_id, quantidade, preco,
-                    timeout=config.TIMEOUT_LOCK_SEGUNDOS,
+                    timeout_s=5.0,
                 )
                 with lock_res:
-                    if ok:
+                    if res["sucesso"]:
                         resultados["sucesso"] += 1
+                    elif "Estoque insuficiente" in res["mensagem"]:
+                        resultados["falha_estoque"] += 1
                     else:
-                        if self.estoque.quantidade(produto_id) == 0:
-                            resultados["falha_estoque"] += 1
-                        else:
-                            resultados["timeout"] += 1
-            except Exception as exc:  # rollback já foi feito dentro de executar_compra_segura
+                        resultados["timeout"] += 1
+            except Exception as exc:
                 with lock_res:
                     resultados["timeout"] += 1
                 print("[Compra] Exceção tratada com rollback: " + str(exc))
 
-        threads = [
-            threading.Thread(target=compra_thread)
-            for _ in range(n_threads)
-        ]
+        threads = [threading.Thread(target=compra_thread, daemon=True)
+                   for _ in range(n_threads)]
         for t in threads:
             t.start()
         for t in threads:
@@ -125,38 +129,37 @@ class ServidorDepois:
         print("Falhas por estoque insuficiente: " +
               str(resultados["falha_estoque"]))
         print("Timeouts/rollback: " + str(resultados["timeout"]))
-        print("Nenhuma travou permanentemente (sem deadlock).")
+        print("Nenhuma travou permanentemente (sem deadlock via ordem global).")
         return resultados
 
-    # ----------------------------------------------------------------
-    # Cenário 3: Relatórios sem starvation
-    # ----------------------------------------------------------------
+    # ------------------------------------------------------------
+    # Cenário 3: Relatórios sem starvation (pool isolado + aging)
+    # ------------------------------------------------------------
     def simular_relatorios(self):
         print("\n" + "=" * 60)
-        print("Cenário 3: Relatórios sem Starvation (pool isolado + aging)")
+        print("Cenário 3: Relatórios sem Starvation (pool de leitura isolado + aging)")
         print("=" * 60)
 
         esperas = []
         lock_esp = threading.Lock()
 
-        # Compras ocupam o pool de COMPRAS (não afetam relatórios)
+        # Compras usam o pool de ESCRITA; relatórios usam pool de LEITURA isolado.
         def compra(i):
             self.estoque.reservar("PROD-002", 1)
 
-        threads_compra = [threading.Thread(target=compra, args=(i,))
+        threads_compra = [threading.Thread(target=compra, args=(i,), daemon=True)
                           for i in range(12)]
         for t in threads_compra:
             t.start()
 
         def relatorio(i):
             espera = self.relatorios.executar_relatorio(
-                "R" + str(i), prioridade="baixa", timeout=10.0
-            )
+                "R" + str(i), prioridade="baixa")
             if espera is not None:
                 with lock_esp:
                     esperas.append(espera)
 
-        threads_rel = [threading.Thread(target=relatorio, args=(i,))
+        threads_rel = [threading.Thread(target=relatorio, args=(i,), daemon=True)
                        for i in range(5)]
         for t in threads_rel:
             t.start()
@@ -169,11 +172,11 @@ class ServidorDepois:
         media = self.relatorios.media_tempo_espera()
         print("Tempo médio de espera dos relatórios: " +
               str(round(media, 3)) + "s")
-        print("Relatórios de baixa prioridade executam graças ao pool dedicado e aging.")
+        print("Relatórios de baixa prioridade executam via pool isolado e aging.")
         return media
 
     def executar_todos(self):
-        print(">>> VERSÃO DEPOIS - Sistema refatorado e seguro <<<")
+        print(">>> VERSÃO DEPOIS - Banco de dados SQLite com controle de concorrência <<<")
         r1 = self.simular_corrida_estoque()
         r2 = self.simular_compra_segura()
         r3 = self.simular_relatorios()

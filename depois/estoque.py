@@ -1,83 +1,65 @@
 """
 Módulo: depois/estoque.py
 ============================================================
-VERSÃO "DEPOIS" - Estoque com atomicidade e exclusão mútua granular
-============================================================
+VERSÃO "DEPOIS" - Estoque com atomicidade via banco de dados (SQLite)
 
-Solução aplicada:
-  * Exclusão mútua granular: um lock distinto por produto, de modo que a
-    região crítica seja o menor possível (apenas o produto alvo).
-  * Operação atômica: leitura (check) e gravação (act) ocorrem dentro do
-    mesmo lock, eliminando a janela de vulnerabilidade do Check-Then-Act.
-  * Região crítica curta: minimiza o tempo dentro do lock, reduzindo
-    contenção e aumentando o throughput sob alta carga.
+Soluções aplicadas:
+  * Atomicidade: a verificação e atualização ocorrem em uma ÚNICA instrução
+    SQL (UPDATE ... WHERE estoque >= ?), dentro de uma transação
+    BEGIN IMMEDIATE. Não há Check-Then-Act separado.
+  * Exclusão mútua no banco: BEGIN IMMEDIATE serializa escritores, evitando
+    atualizações perdidas (lost update).
+  * Região crítica curta: apenas o tempo da instrução UPDATE + commit.
+
+Queries SQL demonstradas:
+    BEGIN IMMEDIATE;
+    UPDATE produtos SET estoque = estoque - ? WHERE id = ? AND estoque >= ?;
+    -- se cursor.rowcount == 1 -> sucesso; se 0 -> estoque insuficiente
+    COMMIT;  (ou ROLLBACK automático em exceção)
+
+Nota: o SQLite embutido no Python 3.11 não suporta SELECT ... FOR UPDATE,
+então a atomicidade é alcançada com UPDATE condicional + BEGIN IMMEDIATE,
+que é a abordagem equivalente e compatível.
 
 Referência clássica:
-  Tanenbaum - Exclusão mútua e seções críticas; locks granulares reduzem
-  a granularidade da contenção sem comprometer a correção.
-  Silberschatz et al. - Região crítica: apenas um processo por vez na seção
-  crítica; solução de software/hardware para exclusão mútua.
+  Silberschatz et al. - Transações e isolamento; atualização atômica via SQL.
+  Tanenbaum - Seções críticas devem ser o menor possível.
 """
 
-import threading
+import sqlite3
 
 
 class EstoqueDepois:
-    """
-    Estoque seguro para concorrência.
-
-    Cada produto tem seu próprio lock (dicionário _locks protegido por um
-    meta-lock). Isso evita que uma operação em "PROD-001" bloqueie
-    operações em "PROD-002" (concorrência real, não serialização total).
-    """
-
-    def __init__(self):
-        self.produtos = {
-            "PROD-001": 5,
-            "PROD-002": 10,
-        }
-        self._locks_por_produto: dict[str, threading.Lock] = {}
-        self._meta_lock = threading.Lock()  # protege a criação de novos locks
-
-    def _obter_lock(self, produto_id: str) -> threading.Lock:
-        """Retorna (criando se necessário) o lock granular do produto."""
-        with self._meta_lock:
-            if produto_id not in self._locks_por_produto:
-                self._locks_por_produto[produto_id] = threading.Lock()
-            return self._locks_por_produto[produto_id]
-
-    def obter_lock_produto(self, produto_id: str) -> threading.Lock:
-        """
-        Expõe o lock do produto para uso externo (ex: transação composta
-        estoque + financeiro que precisa adquirir o lock do estoque antes
-        do financeiro, respeitando a ordem global).
-        """
-        return self._obter_lock(produto_id)
+    def __init__(self, bd):
+        self.bd = bd
 
     def reservar(self, produto_id: str, quantidade: int) -> bool:
         """
-        Reserva de forma atômica.
+        Reserva estoque de forma atômica usando SQL.
 
         >>> SEGURO <<<
-        O lock é adquirido ANTES da leitura e liberado APÓS a gravação.
-        Nenhuma outra thread pode observar estado intermediário.
+        O UPDATE condicional verifica e decrementa em uma única instrução,
+        sob proteção de BEGIN IMMEDIATE. Duas threads concorrentes não
+        conseguem ambas decrementar o mesmo estoque porque o SQLite
+        serializa escritores.
         """
-        lock = self._obter_lock(produto_id)
-        with lock:  # regiao crítica mínima: apenas este produto
-            return self._reservar_sem_lock(produto_id, quantidade)
-
-    def _reservar_sem_lock(self, produto_id: str, quantidade: int) -> bool:
-        """
-        Pressupõe que o caller já detém o lock do produto.
-        Usado por transações compostas que já adquiriram o lock externamente.
-        """
-        atual = self.produtos.get(produto_id, 0)
-        if atual >= quantidade:
-            self.produtos[produto_id] = atual - quantidade
-            return True
-        return False
+        try:
+            with self.bd.transacao(modo="immediato") as cur:
+                cur.execute(
+                    "UPDATE produtos SET estoque = estoque - ? "
+                    "WHERE id = ? AND estoque >= ?",
+                    (quantidade, produto_id, quantidade),
+                )
+                # rowcount = 1 significa que a linha foi atualizada (estoque suficiente)
+                # rowcount = 0 significa estoque insuficiente ou produto inexistente
+                return cur.rowcount == 1
+        except sqlite3.OperationalError:
+            # busy_timeout esgotado: não conseguiu o lock de escrita em 5s
+            return False
 
     def quantidade(self, produto_id: str) -> int:
-        lock = self._obter_lock(produto_id)
-        with lock:
-            return self.produtos.get(produto_id, 0)
+        """Leitura simples de estoque (transação normal de leitura)."""
+        with self.bd.transacao(modo="normal") as cur:
+            cur.execute("SELECT estoque FROM produtos WHERE id = ?", (produto_id,))
+            linha = cur.fetchone()
+            return linha[0] if linha else 0

@@ -2,12 +2,15 @@
 
 Este documento fundamenta, com base em autores clássicos de Sistemas Operacionais, as falhas da versão **"ANTES"** e as soluções aplicadas na versão **"DEPOIS"** do projeto ATP_SO.
 
+> **Nota:** A versão ANTES é implementada puramente em memória (dicionários + `threading.Lock` ausente nas regiões críticas).  
+> A versão DEPOIS utiliza **banco de dados SQLite real** com queries SQL para demonstrar atomicidade, prevenção de deadlock e isolamento de recursos.
+
 ---
 
 ## 1. Referências Teóricas
 
-- **Abraham Silberschatz, Peter Baer Galvin, Greg Gagne** — *Operating System Concepts* ("Silberschatz"). Conceitos de seção crítica, exclusão mútua, condições de corrida, deadlock (condições necessárias, prevenção, detecção, recuperação) e escalonamento/inanição.
-- **Andrew S. Tanenbaum** — *Modern Operating Systems* ("Tanenbaum"). Processos e threads, seções críticas, exclusão mútua por software/hardware, locks granulares, prevenção de deadlock por ordenação de recursos, envelhecimento (aging) e pools de recursos.
+- **Abraham Silberschatz, Peter Baer Galvin, Greg Gagne** — *Operating System Concepts* ("Silberschatz"). Conceitos de seção crítica, exclusão mútua, condições de corrida, deadlock (condições necessárias, prevenção, detecção, recuperação), transações de banco de dados e escalonamento/inanição.
+- **Andrew S. Tanenbaum** — *Modern Operating Systems* ("Tanenbaum"). Processos e threads, seções críticas, exclusão mútua por software/hardware, prevenção de deadlock por ordenação de recursos, envelhecimento (aging) e pools de recursos.
 
 ---
 
@@ -17,7 +20,7 @@ Este documento fundamenta, com base em autores clássicos de Sistemas Operaciona
 
 **Localização:** `antes/estoque.py`, método `reservar()`.
 
-O método executa três etapas não atômicas:
+O método executa três etapas não atômicas em memória:
 1. **READ** — lê a quantidade atual do produto.
 2. **CHECK** — verifica se `estoque >= quantidade solicitada`.
 3. **ACT/WRITE** — grava `estoque - quantidade` com base na leitura anterior.
@@ -67,19 +70,33 @@ Relatórios de baixa prioridade e transações de compra disputam o **mesmo sem�
 
 ---
 
-## 3. Versão "DEPOIS" — Soluções Aplicadas
+## 3. Versão "DEPOIS" — Soluções com Banco de Dados SQL
 
-### 3.1 Atomicidade e Exclusão Mútua Granular
+A versão DEPOIS reimplementa os mesmos cenários usando **SQLite real** com queries SQL, demonstrando que o controle de concorrência pode ser delegado ao gerenciador de transações do banco de dados.
 
-**Localização:** `depois/estoque.py`.
+### 3.1 Atomicidade e Exclusão Mútua via SQL
 
-Cada produto tem seu próprio `threading.Lock` (*lock granular*). A operação `reservar()` adquire o lock **antes** da leitura e o libera **após** a gravação. Dessa forma:
-- Leitura e gravação ocorrem dentro da mesma região crítica — a operação é **atômica**.
-- A região crítica é o menor possível (apenas o produto alvo), minimizando contenção e maximizando throughput sob alta carga.
+**Localização:** `depois/estoque.py`, método `reservar()`.
 
-**Proteção:** elimina a janela de vulnerabilidade do Check-Then-Act. Não há overselling nem estoque negativo.
+Em vez de ler e gravar separadamente em memória, a versão DEPOIS executa uma **única instrução SQL atômica** dentro de `BEGIN IMMEDIATE`:
 
-**Fundamentação:** Tanenbaum recomenda que a seção crítica seja o menor possível. Locks granulares permitem concorrência real (operações em produtos distintos não se bloqueiam mutuamente), ao contrário de um lock global único que serializaria tudo.
+```sql
+BEGIN IMMEDIATE;
+UPDATE produtos
+   SET estoque = estoque - ?
+ WHERE id = ?
+   AND estoque >= ?;
+-- se cursor.rowcount == 1: sucesso
+-- se cursor.rowcount == 0: estoque insuficiente
+COMMIT;
+```
+
+**Por que funciona:**
+- `BEGIN IMMEDIATE` obtém um lock de gravação no banco imediatamente, serializando escritores.
+- O `UPDATE` condicional verifica `estoque >= ?` e decrementa na mesma instrução, eliminando a janela de Check-Then-Act.
+- Se duas threads concorrerem, o SQLite as serializa; apenas uma consegue fazer o `UPDATE` enquanto o estoque for suficiente.
+
+**Referência:** Silberschatz et al. - Transações e isolamento; Tanenbaum - seções críticas mínimas.
 
 ---
 
@@ -87,49 +104,68 @@ Cada produto tem seu próprio `threading.Lock` (*lock granular*). A operação `
 
 **Localização:** `depois/financeiro.py`, função `executar_compra_segura()`.
 
-Três mecanismos atuam em conjunto:
+Uma compra completa ocorre dentro de **uma única transação** `BEGIN IMMEDIATE`, adquirindo recursos na ordem global obrigatória:
 
-1. **Ordem global de aquisição:** toda transação que precise de mais de um recurso deve adquiri-los na sequência fixa `ESTOQUE → FINANCEIRO → PEDIDO` (definida em `depois/config.py`). Como todos os processos seguem a mesma ordem, não há espera circular -> o grafo de dependências é acíclico.
+```sql
+BEGIN IMMEDIATE;                                          -- try_lock (5s via busy_timeout)
+UPDATE produtos SET estoque = estoque - ? ...;            -- 1. ESTOQUE
+INSERT INTO pedidos  ...;                                 -- 2. PEDIDO
+INSERT INTO pagamentos ...;                               -- 3. FINANCEIRO
+COMMIT;                                                   -- libera todos
+```
 
-2. **try_lock com timeout:** em vez de `acquire()` bloqueante (espera ilimitada), usa-se `acquire(timeout=5.0)`. Se o segundo recurso não estiver disponível em 5 segundos, a tentativa falha.
+**Mecanismos de defesa:**
+1. **Ordem global:** ESTOQUE → PEDIDO → FINANCEIRO. Todas as transações seguem a mesma sequência, então não há espera circular (grafo acíclico).
+2. **try_lock com timeout:** `BEGIN IMMEDIATE` + `PRAGMA busy_timeout=5000`. Se outra transação de escrita estiver ativa, o SQLite aguarda até 5 segundos; se não conseguir, levanta `OperationalError`.
+3. **Rollback automático:** qualquer exceção dentro do context manager dispara `ROLLBACK`, liberando locks parciais.
 
-3. **Rollback automático:** se o lock de FINANCEIRO não for obtido, o lock de ESTOQUE já adquirido é liberado antes de abortar a transação (`finally`). Nenhum recurso fica parcialmente bloqueado.
+**Resultado observado:** zero deadlocks, zero travamentos permanentes, mesmo com 10 threads concorrentes.
 
-**Por que não há deadlock:** a ordem total elimina a espera circular; o timeout impede bloqueio indefinido; o rollback garante liberação de recursos parciais.
-
-**Fundamentação:** Silberschatz apresenta a ordenação de recursos como método de prevenção de deadlock. Tanenbaum discute timeouts e rollback como mecanismos de recuperação quando a prevenção falha.
+**Referência:** Silberschatz et al. - prevenção de deadlock por ordenação de recursos; Tanenbaum - timeout e rollback como recuperação.
 
 ---
 
 ### 3.3 Isolamento de Recursos e Escalonamento Justo (Aging / Connection Pooling)
 
-**Localização:** `depois/relatorio.py` e `depois/config.py`.
+**Localização:** `depois/relatorio.py`, `GerenciadorRelatoriosDepois`.
 
-1. **Pools de conexões isolados:** transações de compra usam `POOL_COMPRAS` (10 conexões) e relatórios usam `POOL_RELATORIOS` (5 conexões). As duas classes de trabalho não competem pelas mesmas conexões.
+1. **Pool de leitura isolado:** relatórios usam uma instância separada de `BancoDadosDepois` (mesmo arquivo `.db`, conexão dedicada). Com o modo WAL (*Write-Ahead Logging*) do SQLite, leituras concorrentes não bloqueiam escritas de compras.
+2. **Transação de leitura (`BEGIN`, não `IMMEDIATE`):** relatórios não adquirem lock de escrita, portanto não competem com transações de compra.
+3. **Envelhecimento (aging):** requisições de relatório de baixa prioridade que aguardam além do limite (3 rodadas) são promovidas automaticamente à fila de alta prioridade, evitando starvation.
 
-2. **Envelhecimento (aging):** a fila de relatórios promove automaticamente requisitos de baixa prioridade para alta prioridade após aguardar `LIMITE_AGING` rodadas (configurável, padrão 3). Isso garante que nenhum relatório fique esperando indefinidamente.
+**Resultado observado:** relatórios de baixa prioridade executam com tempo médio de espera próximo de zero, mesmo sob carga de compras.
 
-3. **Escalonamento justo:** FIFO dentro de cada nível de prioridade; a fila alta é atendida antes da baixa, mas o aging impede que a baixa seja esquecida.
-
-**Consequência observada:** relatórios de baixa prioridade executam mesmo sob carga de compras; tempo médio de espera mantido baixo.
-
-**Fundamentação:** Silberschatz recomenda envelhecimento para evitar starvation em escalonamento por prioridade. Tanenbaum defende o particionamento de recursos para isolar classes de trabalho com requisitos distintos.
+**Referência:** Silberschatz et al. - envelhecimento contra starvation; Tanenbaum - particionamento de recursos.
 
 ---
 
 ## 4. Comparativo de Resultados
 
-| Cenário | Versão ANTES | Versão DEPOIS |
-|---------|-------------|---------------|
-| Estoque com 5 unidades, 20 threads | 20 vendas (overselling!), estoque inconsistente | 5 vendas (exato), estoque consistente |
-| Deadlock estoque↔financeiro | Travamento permanente (True) | Nenhum travamento (ordem global + timeout) |
-| Relatórios sob carga de compras | Risco de inanição, pool compartilhado | Execução garantida (pool isolado + aging) |
+| Cenário | Versão ANTES (memória) | Versão DEPOIS (SQLite) |
+|---------|------------------------|------------------------|
+| Estoque 5 unidades, 20 threads | 20 vendas (overselling!), estoque inconsistente | 5 vendas (exato), estoque consistente (0) |
+| Deadlock estoque↔financeiro | Travamento permanente (True) | Nenhum travamento (ordem global + BEGIN IMMEDIATE + timeout) |
+| Relatórios sob carga de compras | Risco de inanição, pool compartilhado | Execução garantida (pool de leitura isolado + aging) |
 
 ---
 
-## 5. Conclusão
+## 5. Queries SQL-chave da Versão DEPOIS
 
-A refatoração demonstra que os problemas de concorrência em sistemas operacionais não são resolvidos por acaso, mas por projeto: **exclusão mútua adequada**, **ordem disciplinada de recursos**, **timeouts com rollback** e **isolamento de pools com escalonamento justo** transformam um sistema propenso a falhas em um sistema previsível e seguro sob alta carga.
+| Propósito | Query |
+|-----------|-------|
+| Iniciar transação exclusiva (try_lock) | `BEGIN IMMEDIATE;` |
+| Reserva atômica de estoque | `UPDATE produtos SET estoque = estoque - ? WHERE id = ? AND estoque >= ?;` |
+| Registrar pedido | `INSERT INTO pedidos (id, produto_id, quantidade, status) VALUES (?, ?, ?, 'confirmado');` |
+| Registrar pagamento | `INSERT INTO pagamentos (pedido_id, valor, status) VALUES (?, ?, 'aprovado');` |
+| Confirmar e liberar locks | `COMMIT;` |
+| Desfazer em falha | `ROLLBACK;` (automático pelo context manager) |
+| Leitura isolada (relatório) | `BEGIN; SELECT ... FROM produtos; COMMIT;` |
+
+---
+
+## 6. Conclusão
+
+A refatoração demonstra que os problemas de concorrência em sistemas operacionais são resolvidos por projeto: **atualização atômica via SQL**, **ordem disciplinada de recursos**, **try_lock com timeout (`BEGIN IMMEDIATE` + `busy_timeout`)**, **rollback automático** e **isolamento de pools com envelhecimento** transformam um sistema propenso a falhas em um sistema previsível e seguro sob alta carga.
 
 ---
 *Projeto ATP_SO — Sistemas Operacionais | Fundamentação: Silberschatz et al., Tanenbaum.*

@@ -2,22 +2,21 @@
 Módulo: depois/relatorio.py
 ============================================================
 VERSÃO "DEPOIS" - Isolamento de recursos e escalonamento justo (Aging)
-============================================================
 
 Soluções aplicadas:
-  1. Isolamento de pools de conexões: transações de COMPRA usam um pool
-     dedicado e rotinas de LEITURA/RELATÓRIO usam outro pool separado.
-     Compras não esgotam conexões necessárias pelos relatórios.
-  2. Envelhecimento (aging): requisitos de relatório de baixa prioridade que
-     aguardam muitas rodadas são promovidos automaticamente para alta
-     prioridade, eliminando a inanição (starvation).
-  3. Fila de escalonamento justa: FIFO dentro de cada nível de prioridade.
+  1. Pool de conexões ISOLADO para relatórios: usa uma instância separada de
+     BancoDadosDepois (mesmo arquivo .db, mas conexão dedicada a leituras).
+     Como usamos WAL (Write-Ahead Logging), leituras concorrentes não bloqueiam
+     escritas de compras, e vice-versa.
+  2. Envelhecimento (aging): requisições de relatório de baixa prioridade que
+     aguardam muitas rodadas são promovidas automaticamente para alta prioridade,
+     evitando starvation.
+  3. Transação normal (BEGIN DEFERRED) para leituras: não adquire lock de
+     escrita, portanto não concorre com transações de compra.
 
 Referência clássica:
-  Silberschatz et al. - Escalonamento por prioridade com envelhecimento
-  (aging) para evitar starvation de processos de baixa prioridade.
-  Tanenbaum - Particionamento de recursos e pools de conexões para isolar
-  classes de trabalho com diferentes requisitos de desempenho.
+  Silberschatz et al. - Envelhecimento (aging) contra starvation.
+  Tanenbaum - Particionamento de recursos para isolar classes de trabalho.
 """
 
 import threading
@@ -25,40 +24,13 @@ import time
 import random
 from collections import deque
 
-from . import config
-
-
-class PoolConexoes:
-    """
-    Pool simples de conexões controlado por semáforo.
-    """
-
-    def __init__(self, tamanho: int, nome: str):
-        self.nome = nome
-        self.tamanho = tamanho
-        self.semaforo = threading.Semaphore(tamanho)
-
-    def adquirir(self, timeout: float = 10.0) -> bool:
-        return self.semaforo.acquire(timeout=timeout)
-
-    def liberar(self):
-        self.semaforo.release()
-
-    def disponiveis(self) -> int:
-        return getattr(self.semaforo, "_valor", self.tamanho)
-
 
 class EnvelhecimentoPrioridade:
-    """
-    Implementa envelhecimento (aging): itens de baixa prioridade que aguardam
-    além do LIMITE_AGING são promovidos à fila de alta prioridade.
-    """
-
     def __init__(self):
         self.fila_alta = deque()
         self.fila_baixa = deque()
         self.lock = threading.Lock()
-        self.contador_espera: dict = {}
+        self.contador_espera = {}
 
     def enfileirar(self, id_requisicao: str, prioridade: str = "baixa"):
         with self.lock:
@@ -69,23 +41,15 @@ class EnvelhecimentoPrioridade:
             self.contador_espera[id_requisicao] = 0
 
     def proximo(self):
-        """
-        Retorna o próximo id da fila respeitando aging.
-        """
         with self.lock:
-            # Aging: promover itens de baixa que esperaram demais
             promovidos = []
             for id_req in list(self.fila_baixa):
                 self.contador_espera[id_req] += 1
-                if self.contador_espera[id_req] >= config.LIMITE_AGING:
+                if self.contador_espera[id_req] >= 3:  # LIMITE_AGING
                     promovidos.append(id_req)
-
             for id_req in promovidos:
                 self.fila_baixa.remove(id_req)
                 self.fila_alta.append(id_req)
-                print("[Aging] " + id_req +
-                      " promovido de baixa para ALTA prioridade.")
-
             if self.fila_alta:
                 return self.fila_alta.popleft()
             if self.fila_baixa:
@@ -107,29 +71,22 @@ class EnvelhecimentoPrioridade:
 
 class GerenciadorRelatoriosDepois:
     """
-    Gerenciador de relatórios com:
-      - Pool de conexões ISOLADO (não compartilhado com compras).
-      - Escalonamento justo com envelhecimento (aging).
+    Gerenciador de relatórios com pool de leitura ISOLADO e escalonamento
+    justo (aging). Não compartilha conexões de escrita com compras.
     """
 
-    def __init__(self, pool: PoolConexoes,
-                 envelhecimento: EnvelhecimentoPrioridade):
-        self.pool = pool
-        self.envelhecimento = envelhecimento
+    def __init__(self, bd_leitura):
+        self.bd_leitura = bd_leitura
+        self.envelhecimento = EnvelhecimentoPrioridade()
         self.tempos_espera = []
         self._lock_resultados = threading.Lock()
 
     def executar_relatorio(self, nome_relatorio: str,
-                           prioridade: str = "baixa",
-                           timeout: float = 10.0):
-        """
-        Executa um relatório aguardando na fila justa e usando o pool
-        dedicado de conexões. Starvation é evitado por aging + pool isolado.
-        """
+                           prioridade: str = "baixa") -> float | None:
         id_req = nome_relatorio
         self.envelhecimento.enfileirar(id_req, prioridade)
 
-        # Espera justa na fila até ser o próximo da vez
+        # Espera na fila justa até ser a próxima da vez
         while True:
             proximo = self.envelhecimento.proximo()
             if proximo == id_req:
@@ -137,27 +94,19 @@ class GerenciadorRelatoriosDepois:
             time.sleep(0.05)
 
         inicio = time.time()
-        adquiriu = self.pool.adquirir(timeout=timeout)
-        espera = time.time() - inicio
-
-        with self._lock_resultados:
-            self.tempos_espera.append(espera)
-
-        if not adquiriu:
-            self.envelhecimento.remover(id_req)
-            print("[RELATORIO " + nome_relatorio +
-                  "] Falha ao obter conexão do pool dedicado.")
-            return None
-
         try:
-            print("[RELATORIO " + nome_relatorio + "] Executando " +
-                  "(pool dedicado, prioridade " + prioridade +
-                  ", espera " + str(round(espera, 3)) + "s)...")
-            time.sleep(random.uniform(0.1, 0.3))  # I/O de leitura isolado
+            # Leitura isolada: BEGIN (não IMMEDIATE), não trava escritores
+            with self.bd_leitura.transacao(modo="normal") as cur:
+                cur.execute("SELECT id, nome, preco, estoque FROM produtos")
+                _ = cur.fetchall()  # simula leitura de relatório
         finally:
-            self.pool.liberar()
+            espera = time.time() - inicio
+            with self._lock_resultados:
+                self.tempos_espera.append(espera)
             self.envelhecimento.remover(id_req)
 
+        print(f"[RELATORIO {nome_relatorio}] Executando (pool de leitura isolado, "
+              f"prioridade {prioridade}, espera {espera:.3f}s)...")
         return espera
 
     def media_tempo_espera(self) -> float:
